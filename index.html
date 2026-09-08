@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<meta name="theme-color" content="#111827">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="manifest" href="manifest.json">
+<title>Digit Recognizer</title>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<style>
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;background:#0b1020;color:#f3f4f6;font-family:system-ui,sans-serif;min-height:100vh}
+main{width:min(560px,100%);margin:auto;padding:18px}
+h1{font-size:28px;margin:4px 0 6px}
+.sub{color:#9ca3af;margin:0 0 18px}
+.tabs{display:flex;gap:8px;margin-bottom:14px}
+button{border:0;border-radius:12px;padding:12px 15px;font-size:16px;font-weight:700;background:#1f2937;color:white}
+button.active{background:#2563eb}
+button:disabled{opacity:.5}
+.panel{background:#111827;border:1px solid #263244;border-radius:18px;padding:15px}
+canvas{display:block;width:100%;max-width:420px;aspect-ratio:1;margin:auto;background:#000;border-radius:14px;touch-action:none}
+.actions{display:flex;gap:8px;margin-top:12px}
+.actions button{flex:1}
+#camera{width:100%;border-radius:14px;background:#000;display:block}
+.result{text-align:center;margin-top:15px}
+.digit{font-size:78px;line-height:1;font-weight:800}
+.conf{font-size:18px;color:#9ca3af}
+.status{text-align:center;color:#9ca3af;margin:12px 0}
+.hidden{display:none!important}
+.install{width:100%;margin-top:12px;background:#059669}
+.note{font-size:13px;color:#9ca3af;margin-top:12px;line-height:1.4}
+</style>
+</head>
+<body>
+<main>
+<h1>Digit Recognizer</h1>
+<p class="sub">Handwritten digits 0–9</p>
+
+<div class="tabs">
+<button id="drawTab" class="active">✍️ Draw</button>
+<button id="camTab">📷 Camera</button>
+</div>
+
+<div id="drawPanel" class="panel">
+<canvas id="canvas" width="280" height="280"></canvas>
+<div class="actions">
+<button id="clearBtn">Clear</button>
+<button id="predictBtn">Predict</button>
+</div>
+</div>
+
+<div id="camPanel" class="panel hidden">
+<video id="camera" autoplay playsinline></video>
+<div class="actions">
+<button id="startCamBtn">Start camera</button>
+<button id="captureBtn" disabled>Capture &amp; recognize</button>
+</div>
+</div>
+
+<button id="installBtn" class="install hidden">Install app</button>
+<div id="status" class="status">Loading neural network…</div>
+
+<div class="result">
+<div id="digit" class="digit">—</div>
+<div id="confidence" class="conf"></div>
+</div>
+
+<p class="note">
+For best results, show one large, clear digit on a dark background.
+The camera recognizer expects a single digit, not a whole number such as 10.
+</p>
+</main>
+
+<script>
+const MODEL_URL =
+"https://huggingface.co/gaurangdave/mnist_cnn/resolve/main/tfjs_graph_model/model.json";
+
+let model = null;
+let stream = null;
+let deferredPrompt = null;
+
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+const statusEl = document.getElementById("status");
+const digitEl = document.getElementById("digit");
+const confidenceEl = document.getElementById("confidence");
+const camera = document.getElementById("camera");
+
+function setStatus(s){ statusEl.textContent=s; }
+
+function resetCanvas(){
+  ctx.fillStyle="#000";
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+}
+resetCanvas();
+
+let drawing=false, lastX=0, lastY=0;
+
+function point(e){
+  const r=canvas.getBoundingClientRect();
+  return {
+    x:(e.clientX-r.left)*canvas.width/r.width,
+    y:(e.clientY-r.top)*canvas.height/r.height
+  };
+}
+canvas.addEventListener("pointerdown",e=>{
+  drawing=true; canvas.setPointerCapture(e.pointerId);
+  const p=point(e); lastX=p.x; lastY=p.y;
+});
+canvas.addEventListener("pointermove",e=>{
+  if(!drawing)return;
+  const p=point(e);
+  ctx.strokeStyle="#fff";
+  ctx.lineWidth=18;
+  ctx.lineCap="round";
+  ctx.lineJoin="round";
+  ctx.beginPath(); ctx.moveTo(lastX,lastY); ctx.lineTo(p.x,p.y); ctx.stroke();
+  lastX=p.x; lastY=p.y;
+});
+["pointerup","pointercancel"].forEach(x=>canvas.addEventListener(x,()=>drawing=false));
+
+function showResult(pred,conf){
+  digitEl.textContent=pred;
+  confidenceEl.textContent=(conf*100).toFixed(1)+"% confidence";
+}
+
+async function predictFromPixels(values){
+  if(!model){setStatus("Model is still loading…");return;}
+  setStatus("Recognizing…");
+  const input=tf.tensor4d(values,[1,28,28,1],"float32");
+  const output=model.predict(input);
+  const probs=Array.from(await output.data());
+  input.dispose();
+  if(output.dispose) output.dispose();
+
+  let best=0;
+  for(let i=1;i<probs.length;i++) if(probs[i]>probs[best]) best=i;
+  showResult(best,probs[best]);
+  setStatus("Ready");
+}
+
+async function predictCanvas(sourceCanvas){
+  const small=document.createElement("canvas");
+  small.width=28; small.height=28;
+  const sctx=small.getContext("2d");
+  sctx.drawImage(sourceCanvas,0,0,28,28);
+  const data=sctx.getImageData(0,0,28,28).data;
+
+  // IMPORTANT: the downloaded MNIST CNN already contains its own
+  // rescaling layer, so feed raw 0–255 grayscale values here.
+  const pixels=[];
+  for(let i=0;i<data.length;i+=4){
+    pixels.push(data[i]);
+  }
+  await predictFromPixels(pixels);
+}
+
+document.getElementById("clearBtn").onclick=()=>{
+  resetCanvas(); showResult("—",0); confidenceEl.textContent="";
+};
+
+document.getElementById("predictBtn").onclick=()=>predictCanvas(canvas);
+
+document.getElementById("drawTab").onclick=()=>{
+  document.getElementById("drawPanel").classList.remove("hidden");
+  document.getElementById("camPanel").classList.add("hidden");
+  document.getElementById("drawTab").classList.add("active");
+  document.getElementById("camTab").classList.remove("active");
+};
+
+document.getElementById("camTab").onclick=()=>{
+  document.getElementById("camPanel").classList.remove("hidden");
+  document.getElementById("drawPanel").classList.add("hidden");
+  document.getElementById("camTab").classList.add("active");
+};
+
+document.getElementById("startCamBtn").onclick=async()=>{
+  try{
+    stream=await navigator.mediaDevices.getUserMedia({
+      video:{facingMode:{ideal:"environment"}},
+      audio:false
+    });
+    camera.srcObject=stream;
+    document.getElementById("captureBtn").disabled=false;
+    setStatus("Camera ready");
+  }catch(e){
+    setStatus("Camera permission was denied or unavailable.");
+  }
+};
+
+document.getElementById("captureBtn").onclick=async()=>{
+  if(!camera.videoWidth){setStatus("Camera is not ready.");return;}
+  const snap=document.createElement("canvas");
+  snap.width=280; snap.height=280;
+  const s=snap.getContext("2d");
+  const vw=camera.videoWidth,vh=camera.videoHeight;
+  const side=Math.min(vw,vh);
+  const sx=(vw-side)/2, sy=(vh-side)/2;
+  s.drawImage(camera,sx,sy,side,side,0,0,280,280);
+
+  // Convert ordinary camera image to MNIST-style white-on-black.
+  const img=s.getImageData(0,0,280,280);
+  for(let i=0;i<img.data.length;i+=4){
+    const gray=.299*img.data[i]+.587*img.data[i+1]+.114*img.data[i+2];
+    const v=255-gray;
+    img.data[i]=img.data[i+1]=img.data[i+2]=v;
+  }
+  s.putImageData(img,0,0);
+  await predictCanvas(snap);
+};
+
+async function loadModel(){
+  try{
+    setStatus("Loading neural network…");
+    await tf.ready();
+    model=await tf.loadGraphModel(MODEL_URL);
+    setStatus("Neural network ready");
+  }catch(e){
+    console.error(e);
+    setStatus("Could not load the neural network. Check your internet connection.");
+  }
+}
+
+window.addEventListener("beforeinstallprompt",e=>{
+  e.preventDefault();
+  deferredPrompt=e;
+  document.getElementById("installBtn").classList.remove("hidden");
+});
+document.getElementById("installBtn").onclick=async()=>{
+  if(!deferredPrompt)return;
+  deferredPrompt.prompt();
+  deferredPrompt=null;
+  document.getElementById("installBtn").classList.add("hidden");
+};
+
+window.addEventListener("appinstalled",()=>{
+  document.getElementById("installBtn").classList.add("hidden");
+  setStatus("App installed");
+});
+
+if("serviceWorker" in navigator){
+  window.addEventListener("load",()=>navigator.serviceWorker.register("sw.js").catch(console.error));
+}
+
+loadModel();
+</script>
+</body>
+</html>
